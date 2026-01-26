@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Comment + close PR
+      - name: Comment + close PR ...
         uses: actions/github-script@v7
         with:
           script: |
