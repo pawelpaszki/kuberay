@@ -15,6 +15,7 @@ import (
 	"github.com/go-logr/logr"
 	routev1 "github.com/openshift/api/route/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +34,7 @@ import (
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 )
 
@@ -85,6 +87,7 @@ func NewAuthenticationController(mgr manager.Manager, options RayClusterReconcil
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=kubeapiservers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=kubeapiservers/status,verbs=get;list;watch
@@ -289,6 +292,10 @@ func (r *AuthenticationController) handleOIDCConfiguration(ctx context.Context, 
 func (r *AuthenticationController) ensureOIDCResources(ctx context.Context, cluster *rayv1.RayCluster, authMode utils.AuthenticationMode, logger logr.Logger) error {
 	if err := r.ensureServiceAccount(ctx, cluster, authMode, logger); err != nil {
 		return fmt.Errorf("failed to ensure service account: %w", err)
+	}
+
+	if err := r.ensureAutoscalerRoleBindingForAuthSA(ctx, cluster, authMode, logger); err != nil {
+		return fmt.Errorf("failed to ensure autoscaler RoleBinding includes auth SA: %w", err)
 	}
 
 	// Create ReferenceGrant BEFORE HTTPRoute to enable cross-namespace service references
@@ -807,6 +814,51 @@ func (r *AuthenticationController) ensureServiceAccount(ctx context.Context, clu
 		logger.Info("Service account reconciled", "name", saName, "operation", opResult, "mode", authMode)
 	}
 
+	return nil
+}
+
+// ensureAutoscalerRoleBindingForAuthSA patches the autoscaler RoleBinding (if it exists)
+// to include the auth proxy ServiceAccount as an additional subject. When the auth
+// controller overrides the head pod's SA, the autoscaler sidecar runs under the new SA
+// and needs permission to get/patch RayClusters.
+func (r *AuthenticationController) ensureAutoscalerRoleBindingForAuthSA(ctx context.Context, cluster *rayv1.RayCluster, authMode utils.AuthenticationMode, logger logr.Logger) error {
+	if !utils.IsAutoscalingEnabled(&cluster.Spec) {
+		return nil
+	}
+
+	namer := utils.NewResourceNamer(cluster)
+	authSAName := namer.ServiceAccountName(authMode)
+
+	roleBinding := &rbacv1.RoleBinding{}
+	namespacedName := common.RayClusterAutoscalerRoleBindingNamespacedName(cluster)
+	if err := r.Get(ctx, namespacedName, roleBinding); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Autoscaler RoleBinding does not exist yet, skipping auth SA patch", "cluster", cluster.Name)
+			return nil
+		}
+		return fmt.Errorf("failed to get autoscaler RoleBinding: %w", err)
+	}
+
+	for _, s := range roleBinding.Subjects {
+		if s.Kind == rbacv1.ServiceAccountKind && s.Name == authSAName && s.Namespace == cluster.Namespace {
+			return nil
+		}
+	}
+
+	roleBinding.Subjects = append(roleBinding.Subjects, rbacv1.Subject{
+		Kind:      rbacv1.ServiceAccountKind,
+		Name:      authSAName,
+		Namespace: cluster.Namespace,
+	})
+
+	if err := r.Update(ctx, roleBinding); err != nil {
+		return fmt.Errorf("failed to update autoscaler RoleBinding with auth SA: %w", err)
+	}
+
+	logger.Info("Added auth proxy SA to autoscaler RoleBinding",
+		"roleBinding", namespacedName,
+		"authServiceAccount", authSAName,
+		"mode", authMode)
 	return nil
 }
 
