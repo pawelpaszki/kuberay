@@ -1250,6 +1250,36 @@ func (r *RayClusterReconciler) buildHeadPod(ctx context.Context, instance rayv1.
 	if r.isMTLSEnabled(&instance) {
 		logger.Info("mTLS is enabled, configuring mTLS for head pod")
 		r.configureMTLSForPod(&podConf, instance)
+
+		// With mTLS enabled, --node-ip-address is set to the head service FQDN by
+		// setMissingRayStartParams (see common/pod.go). This ensures the C++ raylet and GCS
+		// connect to each other using the FQDN, which is a valid DNS SAN in the TLS certificate,
+		// avoiding IP-based TLS SNI failures. RAY_ADDRESS below overrides only the Python
+		// ray.init() path so Python clients connect via loopback instead of the pod IP.
+
+		// Inject RAY_ADDRESS=127.0.0.1:port for both ray-head and autoscaler containers so
+		// Python ray.init() and the autoscaler connect to GCS via loopback, not the FQDN.
+		loopbackAddress := fmt.Sprintf("127.0.0.1:%s", headPort)
+		for i := range podConf.Spec.Containers {
+			container := &podConf.Spec.Containers[i]
+			if i != utils.RayContainerIndex && container.Name != common.AutoscalerContainerName {
+				continue
+			}
+			found := false
+			for j, env := range container.Env {
+				if env.Name == utils.RAY_ADDRESS {
+					container.Env[j].Value = loopbackAddress
+					found = true
+					break
+				}
+			}
+			if !found {
+				container.Env = append(container.Env, corev1.EnvVar{
+					Name:  utils.RAY_ADDRESS,
+					Value: loopbackAddress,
+				})
+			}
+		}
 	}
 
 	// Detect authentication mode and inject appropriate sidecar
@@ -1365,6 +1395,51 @@ func (r *RayClusterReconciler) configureMTLSForPod(podTemplate *corev1.PodTempla
 		r.addTLSEnvironmentVariables(&podTemplate.Spec.InitContainers[i], isWorker)
 		// Add certificate volume mounts
 		r.addCertVolumeMounts(&podTemplate.Spec.InitContainers[i])
+	}
+
+	// For head pods, prepend an init container that waits until the TLS certificate
+	// issued by cert-manager includes the pod's actual IP as an IP SAN. Without this,
+	// there is a race condition: cert-manager issues the initial certificate before the
+	// pod IP is known (so only the FQDN DNS SAN is present), and GCS loads this
+	// incomplete certificate at startup. Python clients that connect via the pod IP
+	// (after resolving the FQDN) then fail TLS verification because no IP SAN matches.
+	// Blocking GCS startup until the cert carries the pod's IP SAN eliminates the race.
+	if !isWorker && len(podTemplate.Spec.Containers) > 0 {
+		waitScript := `POD_IP="${MY_POD_IP}"
+CERT="/home/ray/workspace/tls/tls.crt"
+echo "Waiting for TLS cert to include IP SAN for ${POD_IP}..."
+while true; do
+  if openssl x509 -in "${CERT}" -noout -text 2>/dev/null | grep -q "IP Address:${POD_IP}"; then
+    echo "TLS cert now includes IP SAN for ${POD_IP}"
+    exit 0
+  fi
+  echo "IP SAN for ${POD_IP} not yet in cert, retrying in 5s..."
+  sleep 5
+done`
+		waitInitContainer := corev1.Container{
+			Name:  "wait-for-tls-ip-san",
+			Image: podTemplate.Spec.Containers[0].Image,
+			Env: []corev1.EnvVar{
+				{
+					Name: "MY_POD_IP",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "status.podIP",
+						},
+					},
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "ray-tls-vol",
+					MountPath: "/home/ray/workspace/tls",
+					ReadOnly:  true,
+				},
+			},
+			Command: []string{"sh", "-c"},
+			Args:    []string{waitScript},
+		}
+		podTemplate.Spec.InitContainers = append([]corev1.Container{waitInitContainer}, podTemplate.Spec.InitContainers...)
 	}
 
 	// Add CA volumes with proper secret references
