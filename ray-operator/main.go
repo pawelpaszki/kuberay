@@ -202,6 +202,7 @@ func main() {
 		exitOnError(err, "Unable to set flag gates for known features")
 	}
 	features.LogFeatureGates(setupLog)
+	setupLog.Info("RHOAIENG-102059 verification build", "buildId", "RHOAIENG-102059-verify")
 
 	// validate the batch scheduler configs,
 	// exit with error if the configs is invalid.
